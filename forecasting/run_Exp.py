@@ -3,13 +3,14 @@ import os
 import sys
 import math
 
-# 在import torch之前设置CUDA_VISIBLE_DEVICES
-# 首先解析命令行参数获取privacy_budget_limit
+# Configure CUDA_VISIBLE_DEVICES before importing torch.
+# Parse the device and privacy-budget options before importing torch.
 temp_parser = argparse.ArgumentParser()
 temp_parser.add_argument('--privacy_budget_limit', type=float, default=10.0)
 temp_parser.add_argument('--devices', type=str, default='0')
+temp_parser.add_argument('--gpu_reserve_mb', type=int, default=0)
 temp_args, _ = temp_parser.parse_known_args()
-# 根据privacy_budget_limit设置GPU
+# Select the first device supplied by the launcher.
 # devices = '3'
 # devices = '0'
 privacy_budgets = list(range(1, 21))
@@ -18,12 +19,20 @@ id_gpu = int(temp_args.privacy_budget_limit)
 # selected_gpu = device_ids[privacy_budgets.index(id_gpu) % len(device_ids)]
 selected_gpu = device_ids[0]
 
-# 在import torch之前设置CUDA_VISIBLE_DEVICES
+# Set CUDA_VISIBLE_DEVICES before importing torch.
 os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_gpu)
 print(f"Set CUDA_VISIBLE_DEVICES to: {selected_gpu} (privacy_budget_limit: {temp_args.privacy_budget_limit})")
 
-# 现在可以安全地import torch
+# It is now safe to import torch.
 import torch
+from utils.gpu_reservation import reserve_gpu_memory
+
+# Establish the visible GPU reservation before importing the experiment/model
+# stack, minimizing the window between GPU selection and memory ownership.
+early_gpu_reservation_mb = 0
+if temp_args.gpu_reserve_mb > 0 and torch.cuda.is_available():
+    early_gpu_reservation_mb = reserve_gpu_memory(temp_args.gpu_reserve_mb)
+
 from exp.exp_main import Exp_Main
 from utils.seed_utils import set_seed
 import random
@@ -45,12 +54,14 @@ parser.add_argument('--features', type=str, default='M',
 parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
 parser.add_argument('--freq', type=str, default='h',
                     help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
-parser.add_argument('--checkpoints', type=str, default='', help='location of model checkpoints')
+parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
 parser.add_argument('--label_len', type=int, default=48, help='start token length')
 parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+parser.add_argument('--sampling_stride', type=int, default=None,
+                    help='stride between time-series window starts (default: seq_len + pred_len)')
 
 # SparseTSF
 parser.add_argument('--period_len', type=int, default=24, help='period length')
@@ -123,20 +134,25 @@ parser.add_argument('--privacy_budget_limit', type=float, default=10.0, help='DP
 parser.add_argument('--w', type=float, default=0.01, help='private ratio')
 parser.add_argument('--clipping_norm', type=float, default=0.1, help='per-sample gradient clipping norm (DP mode)')
 parser.add_argument('--result_file', type=str, default=None, help='optional path to append (epsilon, mean_test_loss) results')
+parser.add_argument('--gpu_reserve_mb', type=int, default=0, help='keep this many MiB in the PyTorch CUDA cache until process exit')
 
 # Reproducibility
 parser.add_argument('--seed', type=int, default=None, help='random seed for reproducibility (overrides fix_seed_list if provided)')
 
 args = parser.parse_args()
+if args.sampling_stride is None:
+    args.sampling_stride = args.seq_len + args.pred_len
 # random seed
 fix_seed_list = range(42, 50)
 
 
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
-# GPU已经在import torch之前设置了，这里只需要记录选择的GPU
+# The GPU was configured before importing torch; record the selected device here.
 args.gpu = selected_gpu
 print(f"Using GPU: {args.gpu}")
+if args.use_gpu and early_gpu_reservation_mb <= 0:
+    reserve_gpu_memory(args.gpu_reserve_mb)
 
 # Harmonize dec_in with enc_in for multivariate tasks if not explicitly provided on CLI
 if not any(arg.startswith('--dec_in') for arg in sys.argv):
@@ -183,13 +199,14 @@ if args.is_training:
         args.seed = current_seed
         
         # setting record of experiments
-        setting = '{}_{}_{}_ft{}_sl{}_pl{}_{}_{}_lr{}_iter{}_seed{}_privacy{}_bz{}_w{}_clip{}'.format(
+        setting = '{}_{}_{}_ft{}_sl{}_pl{}_ss{}_{}_{}_lr{}_iter{}_seed{}_privacy{}_bz{}_w{}_clip{}'.format(
             args.model_id,
             args.model,
             args.data,
             args.features,
             args.seq_len,
             args.pred_len,
+            args.sampling_stride,
             args.model_type,
             args.des,
             args.learning_rate,
@@ -212,16 +229,18 @@ if args.is_training:
             print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
             exp.predict(setting, True)
 
-        torch.cuda.empty_cache()
+        if args.gpu_reserve_mb <= 0:
+            torch.cuda.empty_cache()
 else:
     ii = 0
-    setting = '{}_{}_{}_ft{}_sl{}_pl{}_{}_{}_{}_{}_seed{}'.format(
+    setting = '{}_{}_{}_ft{}_sl{}_pl{}_ss{}_{}_{}_{}_{}_seed{}'.format(
         args.model_id,
         args.model,
         args.data,
         args.features,
         args.seq_len,
         args.pred_len,
+        args.sampling_stride,
         args.model_type,
         args.des,
         args.learning_rate,
@@ -231,7 +250,8 @@ else:
     exp = Exp(args)  # set experiments
     print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
     exp.test(setting, test=1)
-    torch.cuda.empty_cache()
+    if args.gpu_reserve_mb <= 0:
+        torch.cuda.empty_cache()
 
 
 print('>>>>>>>all experiments done<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')

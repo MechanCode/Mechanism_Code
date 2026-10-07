@@ -26,28 +26,34 @@ class Model(nn.Module):
         # load parameters
         c_in = configs.enc_in
         context_window = configs.seq_len
-        target_window = configs.seq_len  # For classification, target_window = seq_len
+        target_window = getattr(configs, 'classification_dim', None) or configs.seq_len
+        head_hidden = getattr(configs, 'classifier_hidden', 256)
+        classifier_dropout = getattr(configs, 'classifier_dropout', 0.2)
+        if target_window < 1 or head_hidden < 0:
+            raise ValueError('classification_dim must be positive; classifier_hidden must be nonnegative')
+        if getattr(configs, 'label_mode', 'sequence') == 'point' and target_window != configs.seq_len:
+            raise ValueError('classification_dim compression requires sequence labels')
         
-        n_layers = getattr(configs, 'e_layers', 2)
-        n_heads = getattr(configs, 'n_heads', 4)
-        d_model = getattr(configs, 'd_model', 64)
-        d_ff = getattr(configs, 'd_ff', 128)
-        dropout = getattr(configs, 'dropout', 0.1)
-        fc_dropout = getattr(configs, 'fc_dropout', 0.1)
-        head_dropout = getattr(configs, 'head_dropout', 0.1)
+        n_layers = configs.e_layers
+        n_heads = configs.n_heads
+        d_model = configs.d_model
+        d_ff = configs.d_ff
+        dropout = configs.dropout
+        fc_dropout = configs.fc_dropout
+        head_dropout = configs.head_dropout
         
-        individual = getattr(configs, 'individual', False)
+        individual = configs.individual
     
-        patch_len = getattr(configs, 'patch_len', 16)
-        stride = getattr(configs, 'stride', 8)
-        padding_patch = getattr(configs, 'padding_patch', 'end')
+        patch_len = configs.patch_len
+        stride = configs.stride
+        padding_patch = configs.padding_patch
         
-        revin = getattr(configs, 'revin', False)
-        affine = getattr(configs, 'affine', False)
-        subtract_last = getattr(configs, 'subtract_last', False)
+        revin = configs.revin
+        affine = configs.affine
+        subtract_last = configs.subtract_last
         
-        decomposition = getattr(configs, 'decomposition', False)
-        kernel_size = getattr(configs, 'kernel_size', 25)
+        decomposition = configs.decomposition
+        kernel_size = configs.kernel_size
         
         # Classification parameters
         self.num_classes = configs.num_classes
@@ -65,7 +71,7 @@ class Model(nn.Module):
                                   dropout=dropout, act=act, key_padding_mask=key_padding_mask, padding_var=padding_var, 
                                   attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
                                   pe=pe, learn_pe=learn_pe, fc_dropout=fc_dropout, head_dropout=head_dropout, padding_patch = padding_patch,
-                                  pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin,
+                                  pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
                                   subtract_last=subtract_last, verbose=verbose, **kwargs)
             self.model_res = PatchTST_backbone(c_in=c_in, context_window = context_window, target_window=target_window, patch_len=patch_len, stride=stride, 
                                   max_seq_len=max_seq_len, n_layers=n_layers, d_model=d_model,
@@ -73,7 +79,7 @@ class Model(nn.Module):
                                   dropout=dropout, act=act, key_padding_mask=key_padding_mask, padding_var=padding_var, 
                                   attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
                                   pe=pe, learn_pe=learn_pe, fc_dropout=fc_dropout, head_dropout=head_dropout, padding_patch = padding_patch,
-                                  pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin,
+                                  pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
                                   subtract_last=subtract_last, verbose=verbose, **kwargs)
         else:
             self.model = PatchTST_backbone(c_in=c_in, context_window = context_window, target_window=target_window, patch_len=patch_len, stride=stride, 
@@ -82,7 +88,7 @@ class Model(nn.Module):
                                   dropout=dropout, act=act, key_padding_mask=key_padding_mask, padding_var=padding_var, 
                                   attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
                                   pe=pe, learn_pe=learn_pe, fc_dropout=fc_dropout, head_dropout=head_dropout, padding_patch = padding_patch,
-                                  pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin,
+                                  pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
                                   subtract_last=subtract_last, verbose=verbose, **kwargs)
         
         # Classification head
@@ -96,13 +102,13 @@ class Model(nn.Module):
             )
         else:
             # Sequence-level classification: output [B, num_classes]
-            self.flatten_dim = c_in * self.seq_len
+            self.flatten_dim = c_in * target_window
             self.classifier = nn.Sequential(
-                nn.Linear(self.flatten_dim, 256),
+                nn.Linear(self.flatten_dim, head_hidden),
                 nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(256, self.num_classes)
-            )
+                nn.Dropout(classifier_dropout),
+                nn.Linear(head_hidden, self.num_classes)
+            ) if head_hidden else nn.Linear(self.flatten_dim, self.num_classes)
     
     
     def forward(self, x):           # x: [Batch, Input length, Channel]

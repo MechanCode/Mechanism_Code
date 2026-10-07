@@ -126,7 +126,9 @@ class Exp_Main(Exp_Basic):
         """
         if self.dp_sigma == 0:
             return float('inf')
-        sensitivity_int = math.ceil((self.w + self.args.seq_len + self.args.pred_len - 1) / (self.args.seq_len + self.args.pred_len))
+        L = self.args.seq_len + self.args.pred_len
+        stride = getattr(self.args, 'sampling_stride', L)
+        sensitivity_int = math.ceil((self.w + L - 1) / stride)
         # print(sensitivity_int)
         def T_privacy_loss(alpha, steps):
             """Compute T-privacy loss function for RDP accounting"""
@@ -191,7 +193,7 @@ class Exp_Main(Exp_Basic):
            (optionally in micro-batches to reduce GPU memory)
         2. Clip each sample's gradient by clipping_norm (C)
         3. Aggregate clipped gradients
-        4. Add Gaussian noise with sigma = C (standard DP-SGD convention)
+        4. Add Gaussian noise with sigma = 2 * C (standard DP-SGD convention)
 
         Parameters:
             batch_x: Input batch tensor [batch_size, seq_len, features].
@@ -371,6 +373,9 @@ class Exp_Main(Exp_Basic):
         return avg_loss
 
     def train(self, setting):
+        max_steps = getattr(self.args, 'max_train_steps', None)
+        if max_steps is not None and max_steps <= 0:
+            raise ValueError('max_train_steps must be positive')
         _, train_loader, sampling_rate = self._get_data(flag='train')
         self.sampling_rate = sampling_rate
         _, vali_loader = self._get_data(flag='val')
@@ -412,13 +417,15 @@ class Exp_Main(Exp_Basic):
             print(f"Epoch [{epoch+1}/{self.args.train_epochs}] started")
             
             for i, batch in enumerate(train_loader):
+                if max_steps is not None and self.total_steps >= max_steps:
+                    break
                 if self.should_stop_training:
                     print(f"Training stopped at epoch {epoch+1}, batch {i+1} due to privacy budget limit")
                     break
 
                 # Pre-check: if the next step would exceed privacy budget, stop before optimizer step
-                eps_next = self._update_privacy_accountant(self.total_steps + 1)
-                if eps_next >= self.privacy_budget_limit:
+                eps_next = self._update_privacy_accountant(self.total_steps + 1) if max_steps is None else None
+                if max_steps is None and eps_next >= self.privacy_budget_limit:
                     print(f"Upcoming step would exceed privacy budget (ε={eps_next:.4f} >= {self.privacy_budget_limit}). Stopping before optimizer step.")
                     # One last validation try before stopping to capture a potential best
                     val_loss_batch = self.vali(vali_loader, criterion)
@@ -492,7 +499,7 @@ class Exp_Main(Exp_Basic):
                 self.total_steps += 1
                 
                 # Check privacy budget limit
-                eps = self._update_privacy_accountant(self.total_steps)
+                eps = self._update_privacy_accountant(self.total_steps) if max_steps is None else None
                 # Privacy budget check is done inside _update_privacy_accountant
                 
                 # Show batch progress every 10 batches
@@ -520,10 +527,15 @@ class Exp_Main(Exp_Basic):
             # if early_stopping.counter == 0:  # Model was saved
             #     print(f"  Current Test Loss: {test_loss:.4f}")
             
-            if early_stopping.early_stop:
+            if max_steps is not None and self.total_steps >= max_steps:
+                print(f'Fixed training steps completed: {self.total_steps}')
+                break
+            if max_steps is None and early_stopping.early_stop:
                 print("Early stopping triggered")
                 break
         
+        if max_steps is not None and self.total_steps != max_steps:
+            raise RuntimeError(f'Expected {max_steps} updates, completed {self.total_steps}; increase train_epochs')
         # Load the best model from early stopping
         best_model_path = path + '/' + 'checkpoint.pth'
         # If budget stop occurred and no best checkpoint exists yet, save the current last-safe model.

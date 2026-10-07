@@ -1,0 +1,7 @@
+numpy==2.0.1
+scipy==1.15.3
+pandas==2.3.3
+scikit-learn==1.7.2
+torch==2.5.1
+matplotlib==3.10.0
+dp-accounting==0.4.4

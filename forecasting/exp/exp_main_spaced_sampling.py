@@ -333,10 +333,11 @@ class Exp_Main(Exp_Basic):
                 self.should_stop_training = True
             return eps
         
-        L = (self.args.seq_len + self.args.pred_len)
-        L = int(L)
-        w = math.ceil((self.w + L - 1) / L)
-        t = int(math.floor(self.data_size / L / max(1, self.args.batch_size)))
+        L = int(self.args.seq_len + self.args.pred_len)
+        stride = getattr(self.args, 'sampling_stride', L)
+        w = math.ceil((self.w + L - 1) / stride)
+        sample_num = math.floor((self.data_size - L) / stride) + 1
+        t = int(math.floor(sample_num / max(1, self.args.batch_size)))
 
         def T_privacy_loss(alpha, steps, w, t):
             """Compute T-privacy loss function for RDP accounting"""
@@ -528,7 +529,7 @@ class Exp_Main(Exp_Basic):
                         target = batch_y[:, -self.args.pred_len:, f_dim:]
                         
                         loss = criterion(pred, target)
-                        # 加权累计：loss * 当前batch样本数
+                        # Accumulate the loss weighted by the current batch size.
                         bs = batch_x.size(0)
                         epoch_loss_sum += loss.item() * bs
                         epoch_num += bs

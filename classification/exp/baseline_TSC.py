@@ -80,7 +80,7 @@ class Exp_Baseline_TSC:
             self.data_size = data_size
             # w parameter from args, default 0.01
             w_ratio = getattr(self.args, 'w', 0.01)
-            self.w = int(data_size * self.args.seq_len * w_ratio)
+            self.w = int(data_size * w_ratio)
             print(f"DP Params: Data Size={data_size}, Sampling Rate={self.sampling_rate:.5f}, w={self.w}")
         else:
             _, data_loader = data_provider(self.args, flag)
@@ -95,7 +95,8 @@ class Exp_Baseline_TSC:
             return float('inf')
             
         # Adapted sensitivity calculation for classification
-        sensitivity_int = math.ceil((self.w + self.args.seq_len - 1) / self.args.seq_len)
+        stride = getattr(self.args, 'sampling_stride', None) or self.args.seq_len
+        sensitivity_int = math.ceil((self.w + self.args.seq_len - 1) / stride)
         if sensitivity_int < 1: sensitivity_int = 1
         
         def T_privacy_loss(alpha, steps):
@@ -196,7 +197,7 @@ class Exp_Baseline_TSC:
                     break
                     
                 batch_x = batch_x.float().to(self.device)
-                # 确保 batch_x 是 3D: [B, L, C]
+                # Ensure batch_x has shape [B, L, C].
                 if batch_x.dim() == 2:
                     batch_x = batch_x.unsqueeze(0)
                 

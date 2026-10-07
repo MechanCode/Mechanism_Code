@@ -91,6 +91,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from models.DLinearFeatures import ClassificationFeatures, classification_head
 
 
 class moving_avg(nn.Module):
@@ -130,94 +131,53 @@ class series_decomp(nn.Module):
 
 class Model(nn.Module):
     """
-    Decomposition-Linear for Time Series Classification
-    Optimized for DP-SGD stability:
-    - Input LayerNorm to stabilize input distribution
-    - Feature LayerNorm before classification
-    - ReLU activation (simpler gradient flow)
-    - Flatten-based classification for sequence mode
+    Forecasting DLinear backbone followed by a classification-only head.
+
+    The backbone intentionally matches ``forecasting/models/DLinear.py``;
+    classification uses ``seq_len`` as the backbone output length.
     """
 
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
+        self.pred_len = getattr(configs, 'classification_dim', None) or configs.seq_len
+        if self.pred_len < 1:
+            raise ValueError('classification_dim must be positive')
+        self.individual = configs.individual
         self.enc_in = configs.enc_in
         self.num_classes = configs.num_classes
         self.label_mode = getattr(configs, 'label_mode', 'sequence')
-        
-        # Input normalization layer
-        self.input_norm = nn.LayerNorm(self.enc_in)
 
         # Decomposition Kernel Size
-        kernel_size = min(25, self.seq_len // 4 * 2 + 1)
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        if kernel_size < 3:
-            kernel_size = 3
+        kernel_size = 25
         self.decompsition = series_decomp(kernel_size)
 
-        # Linear layers for time series transformation
-        self.Linear_Seasonal = nn.Linear(self.seq_len, self.seq_len)
-        self.Linear_Trend = nn.Linear(self.seq_len, self.seq_len)
+        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
+        self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         
-        # Feature normalization
-        self.feature_norm = nn.LayerNorm(self.seq_len)
-        
-        # Classification head
-        hidden_dim = 256
+        # The only task-specific addition to the forecasting backbone.
         if self.label_mode == 'point':
-            self.classifier = nn.Sequential(
-                nn.LayerNorm(self.enc_in),
-                nn.Linear(self.enc_in, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, self.num_classes)
-            )
+            if self.pred_len != self.seq_len:
+                raise ValueError('classification_dim compression requires sequence labels')
+            self.classifier = nn.Linear(self.enc_in, self.num_classes)
         else:
-            # Flatten-based: use all temporal information
-            flatten_dim = self.enc_in * self.seq_len
-            self.classifier = nn.Sequential(
-                nn.LayerNorm(flatten_dim),
-                nn.Linear(flatten_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, self.num_classes)
-            )
-        
-        self._init_weights()
-
-    def _init_weights(self):
-        """Xavier initialization with smaller gain for stability"""
-        gain = 0.5  # Smaller gain for reduced gradient variance
-        nn.init.xavier_uniform_(self.Linear_Seasonal.weight, gain=gain)
-        nn.init.zeros_(self.Linear_Seasonal.bias)
-        nn.init.xavier_uniform_(self.Linear_Trend.weight, gain=gain)
-        nn.init.zeros_(self.Linear_Trend.bias)
-        
-        for module in self.classifier.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=gain)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+            self.feature_map = ClassificationFeatures(
+                getattr(configs, 'dlinear_features', 'linear'), self.enc_in, self.pred_len,
+                getattr(configs, 'dlinear_moment_scale', 1.0))
+            self.classifier = classification_head(self.feature_map.output_dim, self.num_classes,
+                                                  getattr(configs, 'dlinear_hidden', 0))
 
     def forward(self, x):
         # x: [Batch, Input length, Channel]
-        x = self.input_norm(x)
-        
+        window = x
         seasonal_init, trend_init = self.decompsition(x)
         seasonal_init, trend_init = seasonal_init.permute(0, 2, 1), trend_init.permute(0, 2, 1)
 
         seasonal_output = self.Linear_Seasonal(seasonal_init)
         trend_output = self.Linear_Trend(trend_init)
 
-        x = seasonal_output + trend_output  # [Batch, Channel, seq_len]
-        x = self.feature_norm(x)
+        x = (seasonal_output + trend_output).permute(0, 2, 1)
         
         if self.label_mode == 'point':
-            x = x.permute(0, 2, 1)
-            logits = self.classifier(x)
-        else:
-            # Flatten: [Batch, Channel * seq_len]
-            x = x.reshape(x.size(0), -1)
-            logits = self.classifier(x)
-        
-        return logits
-
+            return self.classifier(x)
+        return self.classifier(self.feature_map(x, window))

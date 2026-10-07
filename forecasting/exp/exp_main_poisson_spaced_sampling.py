@@ -8,6 +8,8 @@ DP notes:
 - Gaussian noise is injected with sigma = 2 * C (where C = clipping_norm),
   following the spaced sampling DP convention.
 - Privacy budget is tracked via RDP (Rényi Differential Privacy) accounting.
+- Training windows start at 0, sampling_stride, 2 * sampling_stride, ...;
+  the same stride is used by lambda selection and privacy accounting.
 """
 
 import warnings
@@ -70,6 +72,21 @@ class Exp_Main(Exp_Basic):
         self.w = 0  # DP: window parameter for privacy analysis
         self._privacy_cache = {}  # DP: cache for privacy accountant results (step -> eps)
 
+        # Keep window construction and privacy accounting on the same stride.
+        # The command-line runner normally resolves None, but normalizing here
+        # also makes direct/programmatic construction of Exp_Main consistent.
+        window_length = int(args.seq_len + args.pred_len)
+        sampling_stride = getattr(args, 'sampling_stride', None)
+        if sampling_stride is None:
+            sampling_stride = window_length
+        sampling_stride = int(sampling_stride)
+        if sampling_stride <= 0:
+            raise ValueError(
+                f"sampling_stride must be positive, got {sampling_stride}"
+            )
+        self.sampling_stride = sampling_stride
+        self.args.sampling_stride = sampling_stride
+
 
     def _build_model(self):
         from models import DLinear, PatchTST
@@ -96,6 +113,21 @@ class Exp_Main(Exp_Basic):
         else:
             data_set, data_loader = data_provider(self.args, flag)
             return data_set, data_loader
+
+
+    def _sampling_statistics(self):
+        """Return stride-aware quantities shared by both privacy routines.
+
+        ``data_size`` is the raw number of timestamps in the training split.
+        A forecasting window consumes ``seq_len + pred_len`` timestamps, and
+        candidate window starts are 0, stride, 2 * stride, ... .
+        """
+        window_length = int(self.args.seq_len + self.args.pred_len)
+        sample_num = (self.data_size - window_length) // self.sampling_stride + 1
+        affected_windows = math.ceil(
+            (self.w + window_length - 1) / self.sampling_stride
+        )
+        return window_length, affected_windows, sample_num
 
 
     def _select_optimizer(self):
@@ -325,6 +357,9 @@ class Exp_Main(Exp_Basic):
 
 
     def select_space_distance(self):
+        fixed_steps = getattr(self.args, 'max_train_steps', None)
+        if fixed_steps is not None:
+            return self._select_space_distance_fixed_steps(fixed_steps)
         print("before select lambda, data_size:", self.data_size, "w:", self.w)
         """Select optimal lambda (sampling rate) using vectorized computation.
         
@@ -334,11 +369,18 @@ class Exp_Main(Exp_Basic):
         since the privacy loss is not monotonic in step count.
         """
         epoch = 100
-        L = int(self.args.seq_len + self.args.pred_len)
-        w = math.ceil((self.w + L -1) / L)
-        t = int(math.floor(self.data_size / L / max(1, self.args.batch_size)))
-        sample_length = math.floor(self.data_size / L)
+        _, w, sample_num = self._sampling_statistics()
+        t = int(math.floor(sample_num / max(1, self.args.batch_size)))
+        sample_length = sample_num
         steps = epoch * t
+
+        print(
+            "Poisson-spaced sampling geometry:",
+            "stride=", self.sampling_stride,
+            "candidate_windows=", sample_num,
+            "affected_windows=", w,
+            "base_spacing=", t,
+        )
         
         sigma2 = self.dp_sigma * self.dp_sigma
         
@@ -465,6 +507,40 @@ class Exp_Main(Exp_Basic):
         # return min_lam
 
 
+    def _select_space_distance_fixed_steps(self, steps):
+        """Use the existing lambda grid, minimizing privacy loss at fixed T.
+
+        No epsilon budget is used. Clear the step-only accountant cache for
+        each lambda, since cached values are only valid for one geometry.
+        """
+        _, _, sample_num = self._sampling_statistics()
+        t = sample_num // self.args.batch_size
+        if steps <= 0 or t < 1:
+            raise ValueError('Fixed-step selection requires positive steps and enough windows')
+        previous_limit = self.privacy_budget_limit
+        previous_stop = self.should_stop_training
+        best = None
+        try:
+            self.privacy_budget_limit = float('inf')
+            for lam in np.arange(1 / t, 1, 0.01):
+                batch_per_lam = max(1, math.floor(self.args.batch_size / lam))
+                if batch_per_lam > sample_num or sample_num // batch_per_lam < 7:
+                    continue
+                self.args.lam = float(lam)
+                self._privacy_cache.clear()
+                loss = float(self._update_privacy_accountant(steps))
+                if np.isfinite(loss) and (best is None or loss <= best[0]):
+                    best = (loss, float(lam))
+        finally:
+            self.privacy_budget_limit = previous_limit
+            self.should_stop_training = previous_stop
+            self._privacy_cache.clear()
+        if best is None:
+            raise ValueError('No valid lambda on the existing search grid')
+        self.args.lam = best[1]
+        print(f'Fixed-step lambda selected: {best[1]}, steps={steps}, derived privacy loss={best[0]}')
+        return best[1]
+
     def _update_privacy_accountant(self, steps):
         """
         Compute privacy budget ε using optimized RDP accounting with T-privacy loss.
@@ -478,9 +554,7 @@ class Exp_Main(Exp_Basic):
                 self.should_stop_training = True
             return eps
         
-        L = int(self.args.seq_len + self.args.pred_len)
-        w = math.ceil((self.w + L - 1) / L)
-        sample_length = math.floor(self.data_size / L)
+        _, w, sample_length = self._sampling_statistics()
         zeta = np.floor(sample_length / math.floor(self.args.batch_size / self.args.lam))     
         xi = self.args.batch_size / math.floor(self.args.batch_size / self.args.lam)
         # print("parameters", xi, zeta)
@@ -512,7 +586,7 @@ class Exp_Main(Exp_Basic):
             # if np.isnan(m) or m < 0:
             #     return float('inf'), float('inf'), float('inf')
 
-            # 计算权重（与原始相同）
+            # Compute weights using the original formula.
             w_p1 = (zeta - np.floor((w - m * zeta) / 2)) / zeta
             w_p2 = (zeta - np.ceil((w - m * zeta) / 2)) / zeta
             w_m1 = np.floor((w - m * zeta) / 2) / zeta
@@ -540,7 +614,7 @@ class Exp_Main(Exp_Basic):
                     log_terms.append(log_term1)
                     log_terms.append(log_term2)
             
-            # 使用logsumexp安全地计算log(base)
+            # Compute log(base) stably with logsumexp.
             log_base = logsumexp(log_terms)
             # print(log_base)
 
@@ -568,10 +642,10 @@ class Exp_Main(Exp_Basic):
             # log_base = logsumexp(log_terms, axis=0)
             # print("log_base", log_base)
             
-            # 计算损失
-            step_loss = steps / (alpha - 1) * log_base  # 注意：log_base已经是log值
+            # Compute the loss.
+            step_loss = steps / (alpha - 1) * log_base  # log_base is already on the logarithmic scale.
             
-            # 参数损失部分
+            # Compute the parameter-dependent loss term.
             para_loss = (np.log(1/self.dp_delta) + (alpha - 1) * np.log(1 - 1/alpha) - np.log(alpha)) / (alpha - 1)
             
             # print("logsumexp step loss", alpha, step_loss, "para_loss", para_loss)
@@ -628,6 +702,9 @@ class Exp_Main(Exp_Basic):
 
 
     def train(self, setting):
+        max_steps = getattr(self.args, 'max_train_steps', None)
+        if max_steps is not None and max_steps <= 0:
+            raise ValueError('max_train_steps must be positive')
         # Build a temporary training dataset to get data_size and w before selecting lambda
         from data_provider.data_loader import Dataset_Custom
         timeenc = 0 if self.args.embed != 'timeF' else 1
@@ -641,7 +718,8 @@ class Exp_Main(Exp_Basic):
             timeenc=timeenc,
             freq=self.args.freq,
         )
-        self.data_size = len(temp_dataset)
+        L = self.args.seq_len + self.args.pred_len
+        self.data_size = len(temp_dataset) + L - 1
         self.w = int(self.data_size * self.args.w)
         # self.w = int(self.args.w)
 
@@ -689,13 +767,15 @@ class Exp_Main(Exp_Basic):
             print(f"Epoch [{epoch+1}/{self.args.train_epochs}] started")
             
             for i, batch in enumerate(train_loader):
+                if max_steps is not None and self.total_steps >= max_steps:
+                    break
                 if self.should_stop_training:
                     print(f"Training stopped at epoch {epoch+1}, batch {i+1} due to privacy budget limit")
                     break
 
                 # Pre-check: if the next step would exceed privacy budget, stop before optimizer step
-                eps_next = self._update_privacy_accountant(self.total_steps + 1)
-                if eps_next >= self.privacy_budget_limit:
+                eps_next = self._update_privacy_accountant(self.total_steps + 1) if max_steps is None else None
+                if max_steps is None and eps_next >= self.privacy_budget_limit:
                     print(f"Upcoming step would exceed privacy budget (ε={eps_next:.4f} >= {self.privacy_budget_limit}). Stopping before optimizer step.")
                     # One last validation try before stopping to capture a potential best
                     val_loss_batch = self.vali(vali_loader, criterion)
@@ -768,7 +848,7 @@ class Exp_Main(Exp_Basic):
                 self.total_steps += 1
                 
                 # Check privacy budget limit
-                eps = self._update_privacy_accountant(self.total_steps)
+                eps = self._update_privacy_accountant(self.total_steps) if max_steps is None else None
                 # Privacy budget check is done inside _update_privacy_accountant
                 
                 # Show batch progress every 10 batches
@@ -776,7 +856,7 @@ class Exp_Main(Exp_Basic):
                     print(f"  Batch [{i+1}/{len(train_loader)}] processed")
                     print("Current privacy budget: ", eps, "Total steps:", self.total_steps)
             
-            # Log epoch statistics（样本加权平均）
+            # Log epoch statistics using the sample-weighted mean.
             avg_epoch_loss = (epoch_loss_sum / epoch_num) if epoch_num > 0 else 0
             print(f"Epoch [{epoch+1}/{self.args.train_epochs}] completed. Average loss: {avg_epoch_loss:.4f}")
             
@@ -795,10 +875,15 @@ class Exp_Main(Exp_Basic):
             
             # Removed best_meta.json writes; checkpoint.pth reflects the best so far
             
-            if early_stopping.early_stop:
+            if max_steps is not None and self.total_steps >= max_steps:
+                print(f'Fixed training steps completed: {self.total_steps}')
+                break
+            if max_steps is None and early_stopping.early_stop:
                 print("Early stopping triggered")
                 break
         
+        if max_steps is not None and self.total_steps != max_steps:
+            raise RuntimeError(f'Expected {max_steps} updates, completed {self.total_steps}; increase train_epochs')
         # Load the best model from early stopping
         best_model_path = path + '/' + 'checkpoint.pth'
         # If budget stop occurred and no best checkpoint exists yet, save the current last-safe model.

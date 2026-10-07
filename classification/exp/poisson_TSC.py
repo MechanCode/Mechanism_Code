@@ -90,7 +90,7 @@ class Exp_Poisson_TSC:
             _, data_loader, data_size = data_provider(self.args, flag)
             self.data_size = data_size
             w_ratio = getattr(self.args, 'w', 0.01)
-            self.w = int(data_size * self.args.seq_len * w_ratio)
+            self.w = int(data_size * w_ratio)
             print(f"DP Params: Data Size={data_size}, w={self.w}")
         else:
             _, data_loader = data_provider(self.args, flag)
@@ -141,9 +141,10 @@ class Exp_Poisson_TSC:
     def select_space_distance(self):
         epoch = 100
         L = self.args.seq_len
-        w = math.ceil((self.w + L - 1) / L)
-        t = int(math.floor(self.data_size / max(1, self.args.batch_size)))
-        sample_length = self.data_size
+        stride = getattr(self.args, 'sampling_stride', None) or L
+        w = math.ceil((self.w + L - 1) / stride)
+        sample_length = math.floor((self.data_size - L) / stride) + 1
+        t = int(math.floor(sample_length / max(1, self.args.batch_size)))
         steps = epoch * t
         
         sigma2 = self.dp_sigma * self.dp_sigma
@@ -270,8 +271,9 @@ class Exp_Poisson_TSC:
         This provides tighter privacy bounds compared to simple approximation
         """
         L = self.args.seq_len
-        w = math.ceil((self.w + L - 1) / L)
-        sample_length = self.data_size
+        stride = getattr(self.args, 'sampling_stride', None) or L
+        w = math.ceil((self.w + L - 1) / stride)
+        sample_length = math.floor((self.data_size - L) / stride) + 1
         zeta = np.floor(sample_length / math.floor(self.args.batch_size / self.args.lam))     
         xi = self.args.batch_size / math.floor(self.args.batch_size / self.args.lam)
 

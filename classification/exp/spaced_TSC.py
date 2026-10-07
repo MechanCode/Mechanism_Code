@@ -87,7 +87,7 @@ class Exp_Spaced_TSC:
             _, data_loader,  data_size = data_provider(self.args, flag)
             self.data_size = data_size
             w_ratio = getattr(self.args, 'w', 0.01)
-            self.w = int(data_size * self.args.seq_len * w_ratio)
+            self.w = int(data_size * w_ratio)
             print(f"DP Params: Data Size={data_size}, w={self.w}")
         else:
             _, data_loader = data_provider(self.args, flag)
@@ -143,8 +143,9 @@ class Exp_Spaced_TSC:
             return float('inf')
         
         L = self.args.seq_len
-        w = math.ceil((self.w + L - 1) / L)
-        sample_length = self.data_size
+        stride = getattr(self.args, 'sampling_stride', None) or L
+        w = math.ceil((self.w + L - 1) / stride)
+        sample_length = math.floor((self.data_size - L) / stride) + 1
         
         batch_per_lam = math.floor(self.args.batch_size / self.lam)
         if batch_per_lam <= 0:

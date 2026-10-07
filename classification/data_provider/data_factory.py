@@ -62,12 +62,15 @@ def data_provider(args, flag):
         flag=flag,
         size=args.seq_len,
         label_mode=label_mode,
+        window_stride=1 if flag == 'train' else args.seq_len,
     )
     if flag == 'train':
         size=args.seq_len
-        batch_sampler = PoissonSamplerWithOutReplacement(data_set, args.batch_size, size)
-        g = torch.Generator()
+        sampling_stride = getattr(args, 'sampling_stride', None) or args.seq_len
         seed = getattr(args, 'seed', 42)
+        batch_sampler = PoissonSamplerWithOutReplacement(
+            data_set, args.batch_size, size, stride=sampling_stride, seed=seed)
+        g = torch.Generator()
         g.manual_seed(seed)
         # print(flag, len(data_set), len(data_set[0]), len(data_set[0][0]))
         data_loader = DataLoader(
@@ -77,7 +80,7 @@ def data_provider(args, flag):
             collate_fn=_batch_collate,
             worker_init_fn=seed_worker,
             generator=g)
-        return data_set, data_loader, batch_sampler.sampling_value(), len(data_set)
+        return data_set, data_loader, batch_sampler.sampling_value(), data_set.raw_data_size
     else:
         g = torch.Generator()
         seed = getattr(args, 'seed', 42)

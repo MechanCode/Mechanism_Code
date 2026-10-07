@@ -78,7 +78,14 @@ def data_provider(args, flag):
     
     if flag == 'train':
         size=[args.seq_len, args.label_len, args.pred_len]
-        batch_sampler = PoissonSamplerWithOutReplacement(data_set, args.batch_size, size, seed=seed)
+        sampling_stride = getattr(args, 'sampling_stride', args.seq_len + args.pred_len)
+        batch_sampler = PoissonSamplerWithOutReplacement(
+            data_set,
+            args.batch_size,
+            size,
+            stride=sampling_stride,
+            seed=seed,
+        )
         # print(flag, len(data_set), len(data_set[0]), len(data_set[0][0]))
         data_loader = DataLoader(
             data_set,
@@ -87,7 +94,8 @@ def data_provider(args, flag):
             collate_fn=custom_collate_fn,
             worker_init_fn=get_worker_init_fn(seed) if seed is not None else None,
             generator=get_dataloader_generator(seed) if seed is not None else None)
-        return data_set, data_loader, batch_sampler.sampling_value(), len(data_set)
+        raw_data_size = len(data_set) + args.seq_len + args.pred_len - 1
+        return data_set, data_loader, batch_sampler.sampling_value(), raw_data_size
     else:
         data_loader = DataLoader(
             data_set,

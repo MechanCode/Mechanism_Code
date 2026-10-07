@@ -17,7 +17,9 @@ def get_stratum_id(date, dataset_name):
 
     
 class Dataset_Custom(Dataset):
-    def __init__(self, train_path, test_path, flag='train', size=None, stratification=None, val_ratio=0.2, label_mode='sequence', val_path=None):
+    def __init__(self, train_path, test_path, flag='train', size=None, stratification=None,
+                 val_ratio=0.2, label_mode='sequence', val_path=None,
+                 window_stride=None):
         """
         Args:
             train_path: Path to the training data CSV file
@@ -34,6 +36,11 @@ class Dataset_Custom(Dataset):
         self.flag = flag
         self.val_ratio = val_ratio
         self.label_mode = label_mode  # 'sequence' or 'point'
+        self.window_stride = self.seq_len if window_stride is None else window_stride
+        if self.seq_len <= 0:
+            raise ValueError(f'seq_len must be positive, got {self.seq_len}')
+        if self.window_stride <= 0:
+            raise ValueError(f'window_stride must be positive, got {self.window_stride}')
         
         if val_path is None:
             train_dir = os.path.dirname(train_path)
@@ -87,14 +94,16 @@ class Dataset_Custom(Dataset):
             print(f"Training data loaded: {len(self.data)} samples, labels range: {self.label.min()}-{self.label.max()}")
         
         self.data_shape = (len(self.data), self.data.shape[1] if len(self.data) > 0 else 0)
+        self.raw_data_size = len(self.data)
 
     def __getitem__(self, index):
         return self._get_single_item(index)
 
     def _get_single_item(self, index):
-        # `index` is a window id in [0, len(self)-1]
-        # Map it to the raw row offset.
-        s_begin = int(index) * self.seq_len
+        # Map a window id to its raw row offset.  Training uses unit-stride
+        # window ids and lets the batch sampler apply ``sampling_stride``;
+        # validation/test retain the historical non-overlapping default.
+        s_begin = int(index) * self.window_stride
         s_end = s_begin + self.seq_len
     
         seq_data = self.data[s_begin:s_end].astype(np.float32)
@@ -112,4 +121,6 @@ class Dataset_Custom(Dataset):
         return seq_data, seq_label
 
     def __len__(self):
-        return len(self.data) // self.seq_len
+        if len(self.data) < self.seq_len:
+            return 0
+        return (len(self.data) - self.seq_len) // self.window_stride + 1
